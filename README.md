@@ -63,7 +63,7 @@ re-frames the existing MP3 data to constant bitrate without a re-encode.
 |------------------------------|-------|
 | Cutscenes                    | ✅ working |
 | Radio                        | ✅ working (≈32 ms warm-up tick on tune-in, see notes) |
-| Speech / pain banks          | 🧪 converter done, in-game hook test pending |
+| Banks                        | ✅ working |
 | Radio "downgrader" (restoring removed Complete-Edition songs as MP3) | 📋 planned |
 
 ---
@@ -76,7 +76,7 @@ asi/            The ASI plugin (C++/MinHook/minimp3)
   diagnostics/    optional logging builds used while reverse-engineering
 tools/          Python converters & analyzers
   gta4_ps3_audio.py   radio/cutscene pipeline (RPF in → swapped RPF out)
-  bank_swap.py        speech/pain bank pipeline (per sub-sound)
+  bank_swap.py        bank pipeline (per sub-sound)
   analyze_packed.py   verify an MP3 is clean uniform CBR
   mp3_framemap.py     CBR/VBR frame analyzer
 docs/
