@@ -15,7 +15,7 @@ You still supply yourself:
 
 ## Scripts
 - `gta4_ps3_audio.py` — main RPF→RPF pipeline (`--batch`, `--dry-run`). Swaps
-  streamed radio/cutscene ivauds AND auto-detects non-streamed speech/pain banks,
+  streamed radio/cutscene ivauds AND auto-detects non-streamed audio banks,
   routing them through `bank_swap` (grow mode). One pass does everything in an RPF.
 - `bank_swap.py` — bank swap, also usable standalone. Default = **grow mode**:
   rebuilds the data region so each sound fits its whole MP3 (no tail cut); the
