@@ -113,8 +113,13 @@ def payload_swap(pc_in, mp3_list, target_rate=None):
 
     rate_patched = False
     if target_rate:
-        # main header
-        struct.pack_into('<I', pc, table_off + 0x04, int(target_rate))
+        # Per-block table at table_off: pairs (start_sample u32, rate u32), one entry
+        # per block. EVERY entry carries the rate - patching only the first (table_off
+        # +0x04) leaves blocks 1..n at the old rate, so the stream's timeline desyncs
+        # after block 0 and the channels scramble. Patch every block's rate field.
+        # start_sample stays untouched (it is a sample position, rate-independent).
+        for i in range(blocks):
+            struct.pack_into('<I', pc, table_off + i*8 + 0x04, int(target_rate))
         # per channel: channel_info_off = ch_tab + channels*0x10 + rel
         for c in range(channels):
             rel = _ru64(pc, ch_tab + c * 0x10)
