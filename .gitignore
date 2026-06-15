@@ -1,0 +1,33 @@
+# Build output
+*.asi
+*.dll
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+/asi/x64/
+/asi/Win32/
+/asi/Release/
+/asi/Debug/
+*.vcxproj.user
+.vs/
+
+# Third-party (fetch yourself)
+asi/minimp3.h
+asi/minhook/
+asi/MinHook/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local data / outputs (never commit game assets!)
+*.rpf
+*.ivaud
+*.mp3
+*.wav
+hashes.txt
+/out/
+/test/
+gta4mp3.log
