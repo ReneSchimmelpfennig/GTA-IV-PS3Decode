@@ -153,6 +153,5 @@ affiliated with or endorsed by Rockstar Games or Take-Two.
 
 ## License
 
-Original code in this repository is released under the [MIT License](LICENSE)
-(change this if you prefer). Bundled/required third parties keep their own licenses —
+Original code in this repository is released under the [MIT License](LICENSE). Bundled/required third parties keep their own licenses —
 see [`THIRD_PARTY.md`](THIRD_PARTY.md).
