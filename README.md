@@ -1,6 +1,6 @@
 # GTA IV — PS3 Audio Mod
 
-First off, let me be transparent and say that Claude (Opus 4.8) wrote the code, while I am just an orchestrator. Real modders, please don't see this as an attack on your work, I just started playing around with Claude (not "Speed", in fact it was quite a slow process), hours turned into day and days turned into weeks and suddenly I got a somehow working script. Enjoy :)
+First off, let me be transparent and say that Claude (Opus 4.8) wrote the code, while I am just an orchestrator. Real modders, please don't see this as an attack on your work, I just started playing around with Claude (not "Speed", in fact it was quite a slow process), hours turned into days and days turned into weeks and suddenly I got a somehow working script, something I had never expected. Enjoy :)
 
 Replace **GTA IV (PC)**'s software-decoded ADPCM audio with the **PS3 version's
 MP3 audio**, for noticeably better-sounding radio, cutscenes and speech — without
