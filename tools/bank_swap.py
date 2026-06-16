@@ -93,6 +93,39 @@ def frames_end(b):
         i += fl; last = i
     return last
 
+def clean_stream(b):
+    """Rebuild a pure CBR stream: keep only valid Layer III AUDIO frames, dropping
+    Xing/Info/encoder tag frames (silent, 0 samples) wherever they occur, plus any
+    leading/trailing/embedded non-frame junk bytes.
+
+    Used on radio channel MP3s so the in-game decoder never has to skip tag frames
+    mid-stream. Skipped tag frames decode to 0 samples, which starves the decoder
+    FIFO for that call -> small warm-up / mid-playback silence pads. A leading tag
+    also shifts the first-frame offset -> a larger tune-in pad. Removing all tag
+    frames yields uniform CBR (every input byte = audio), so the FIFO stays full.
+
+    Both stereo channels carry their tags at the same positions, so cleaning each
+    channel identically preserves L/R frame alignment (the streamed swap shares one
+    read position across channels). Returns (clean_bytes, dropped_tags, junk_bytes).
+    """
+    out = bytearray()
+    i, n = 0, len(b)
+    dropped = junk = 0
+    while i < n:
+        fl = frame_len(b, i)
+        if fl == 0 or i + fl > n:        # not a valid/complete frame -> junk byte
+            i += 1; junk += 1
+            continue
+        ver  = (b[i+1] >> 3) & 3
+        mono = ((b[i+3] >> 6) & 3) == 3
+        side = (17 if mono else 32) if ver == 3 else (9 if mono else 17)
+        if b[i+4+side:i+4+side+4] in (b'Xing', b'Info'):
+            dropped += 1                 # tag frame (silent) -> drop
+        else:
+            out += b[i:i+fl]             # real audio frame -> keep
+        i += fl
+    return bytes(out), dropped, junk
+
 def detect_le(d):
     le = struct.unpack('<Q', d[0:8])[0]
     return le < len(d)
