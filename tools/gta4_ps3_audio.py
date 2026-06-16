@@ -143,6 +143,15 @@ def process_ivaud(pc_data, ps3_data, cbr, mp3packer):
     except Exception as e:
         return None, "ERROR: mp3packer (%s)" % e
 
+    # --- strip Xing/Info/encoder tag frames from every channel (symmetrically) ---
+    # mp3packer leaves tag frames (and a leading header) in the stream; the in-game
+    # decoder skips them (0 samples) and briefly starves -> tune-in / mid-play pads.
+    # Cleaning is identical per channel, so L/R frame alignment is preserved.
+    cleaned = [bank_swap.clean_stream(m) for m in mp3]
+    mp3 = [c[0] for c in cleaned]
+    n_tags = sum(c[1] for c in cleaned)
+    n_junk = sum(c[2] for c in cleaned)
+
     warn = ""
     nonstrict = [c for c, m in enumerate(mp3) if not _is_strict_cbr(m)]
     if nonstrict:
@@ -160,6 +169,8 @@ def process_ivaud(pc_data, ps3_data, cbr, mp3packer):
     note = "OK  %d channels @ %d Hz  CBR %d" % (info['channels'], h['sample_rate'], cbr)
     if target:
         note += "  [rate %d->%d]" % (pc_rate, h['sample_rate'])
+    if n_tags or n_junk:
+        note += "  [cleaned %d tag frames, %d junk bytes]" % (n_tags, n_junk)
     if not info['complete']:
         det = ", ".join("ch%d mp3=%d slot=%d (%d%%)" %
                         (c, len(mp3[c]), info['capacity'][c],
