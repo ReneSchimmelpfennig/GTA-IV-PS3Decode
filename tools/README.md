@@ -8,6 +8,7 @@ lossless VBR→CBR step (`--mp3packer <path>` or have it on PATH) and need
 - `rpf3.py` — RPF3 reader/writer + AES key extraction
 - `rage_aud_deinterleave.py` — PS3 ivaud → per-channel mono MP3
 - `ivaud_payloadswap.py` — byte-exact payload swap
+- `mp3packer.exe` — losslessly repacks PS3 MP3's so that they are CBR instead of VBR --> [source](https://hydrogenaudio.org/index.php/topic,32379.0.html), credit user "Omion"
 
 You still supply yourself:
 - `hashes.txt` — RPF name-hash table (not redistributed here)
