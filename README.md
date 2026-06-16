@@ -84,10 +84,9 @@ docs/
   BUILD.md        building the ASI
 ```
 
-### Files you must add yourself
+### Tools
 
-These are referenced by the tools but are **not** included (they are part of your
-own toolchain and/or contain data tied to your game install):
+These tools are included and used to create Frankenstein RPFs that contain PS3 audio but adhere to PC RPF standards:
 
 - `tools/rpf3.py` — RPF3 reader/writer + AES key extraction
 - `tools/rage_aud_deinterleave.py` — PS3 ivaud → per-channel mono MP3
@@ -108,21 +107,15 @@ See [`THIRD_PARTY.md`](THIRD_PARTY.md).
 ### 1. Build the ASI
 See [`docs/BUILD.md`](docs/BUILD.md). Result: `GTA4MP3.asi` → drop into
 `...\Grand Theft Auto IV\GTAIV\plugins\` (requires an ASI loader).
+Compiled ASI can be found in releases. It includes the actual hook and PS3 decoder for the game.
 
-### 2. Convert radio / cutscenes
+### 2. Convert PS3 RPFs into a format the PC version can read (lossless process)
 ```
 py tools/gta4_ps3_audio.py <GTAIV.exe> <pc.rpf> <ps3.rpf> -o <out.rpf> \
    --mp3packer C:\path\mp3packer.exe
 # batch over folders:
 py tools/gta4_ps3_audio.py <pc_dir> <ps3_dir> -o <out_dir> --batch --mp3packer ...
 ```
-
-### 3. Convert speech / pain banks
-```
-py tools/bank_swap.py <pc_bank.ivaud> <ps3_bank.ivaud> -o <out.ivaud> \
-   --mp3packer C:\path\mp3packer.exe
-```
-(`--dry-run` previews matches/rates without writing.)
 
 ---
 
@@ -152,6 +145,7 @@ can read/write the audio containers. Use at your own risk; this project is not
 affiliated with or endorsed by Rockstar Games or Take-Two.
 
 ## License
+
 
 Original code in this repository is released under the [MIT License](LICENSE). Bundled/required third parties keep their own licenses —
 see [`THIRD_PARTY.md`](THIRD_PARTY.md).
