@@ -1,5 +1,5 @@
 // ============================================================================
-//  GTA IV - MP3 decoder  -  Fix #8 "MARGIN + FIFO"  (PRODUCTION)
+//  GTA IV - MP3 decoder  -  Fix #9 "MARGIN + FIFO + PRE-ROLL"  (PRODUCTION)
 //  ---------------------------------------------------------------------------
 //  Dropout cause (proven offline on ch0_r.mp3): when fed in chunks, minimp3
 //  decodes the LAST frame in the buffer speculatively, before the next frame
@@ -9,8 +9,18 @@
 //       are buffered (minimp3 sees the next header -> full samples).
 //   (2) FIFO: buffer all completed frames, emit 'want' from it -> smooths the
 //       integer-frame quantization.
-//  Result (verified offline): 0.069% silence, of which ~100ms is the tune-in
-//  warm-up; after that practically dropout-free. File/container/feed are clean.
+//   (3) PRE-ROLL: the first 32768-byte chunk is not a whole number of frames,
+//       so the first call is ~1024 samples (32ms) short. Fix #8 padded that at
+//       the END of the first buffer -> the silence surfaced ~2s into playback as
+//       an audible hiccup (confirmed by the tune-in decode log). Inject the
+//       lead-in silence at the FRONT instead: the stream starts ~68ms later
+//       (inaudible, hidden in the station switch) and then plays gap-free. The
+//       cushion also absorbs the small mid-playback frame-quantization dips.
+//       Rate-gated: applied only to streamed radio/cutscene audio (>=32kHz);
+//       low-rate one-shot speech/pain banks are skipped so their tail isn't cut.
+//  Result: dropout-free steady state (Fix #8) with the tune-in gap moved to an
+//  inaudible lead-in. Best paired with the tag-cleaned pipeline (clean_stream),
+//  which makes the latch deficit a uniform 1024 on every stream.
 // ============================================================================
 #include <windows.h>
 #include <cstdint>
@@ -29,6 +39,11 @@ static const size_t    MARGIN     = 640;    // look-ahead before the last frame 
                                             // (~32ms, one blip on tune-in) for strict CBR-128.
                                             // Raise it only if content were >128 kbps
                                             // (the pipeline never produces that).
+static const int       PREROLL_SAMPLES = 2176;  // lead-in silence injected at latch
+                                            // (see header). 2176 @32kHz = ~68ms: covers
+                                            // the first-chunk deficit + 1 frame cushion.
+static const int       PREROLL_MIN_HZ  = 32000; // only pre-roll streamed audio >= this
+                                            // rate (radio/cutscene); NOT low-rate banks.
 
 typedef int(__fastcall* Decode_t)(void*, void*, int16_t*, void*, unsigned int, int);
 static Decode_t oDecode = nullptr;
@@ -118,6 +133,16 @@ int __fastcall hkDecode(void* st, void* edx, int16_t* outPcm, void* inData, unsi
             c->inbuf.assign(tmp.begin() + off, tmp.end());
             c->inpos = 0; c->fifo.clear();
             DecodeAll(c);
+            // PRE-ROLL: inject lead-in silence at the FRONT, once, at latch. The
+            // first chunk is not a whole number of frames, so the first call is
+            // ~1024 samples short; padding at the END drops that gap ~2s into
+            // playback (audible hiccup). Front-loading it shifts the whole stream
+            // ~68ms later and plays gap-free, and leaves a FIFO cushion that
+            // absorbs mid-stream frame-quantization dips. Gated by rate: only
+            // streamed radio/cutscene (>=32kHz) has this deficit; low-rate banks
+            // are one-shot and would only lose their tail end -> skip them.
+            if (PREROLL_SAMPLES > 0 && pi.hz >= PREROLL_MIN_HZ)
+                c->fifo.insert(c->fifo.begin(), (size_t)PREROLL_SAMPLES, 0);
             Emit(c, outPcm, want);
             return numSamples * 4;
         }
