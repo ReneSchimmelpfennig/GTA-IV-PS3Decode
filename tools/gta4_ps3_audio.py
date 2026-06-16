@@ -101,8 +101,8 @@ def _process_bank(pc_data, ps3_data, mp3packer):
     except Exception as e:
         return None, "skip: bank-swap error (%s)" % e
     if st['swapped'] == 0:
-        return None, "skip: bank, nothing swappable (%d PCM, %d no-match)" \
-                     % (st['skipped_codec'], st['skipped_nomatch'])
+        return None, "skip: bank, nothing swappable (%d PCM, %d no-match, %d rate)" \
+                     % (st['skipped_codec'], st['skipped_nomatch'], st['skipped_rate'])
     note = "BANK ok  %d sounds" % st['swapped']
     if st['skipped_codec']:
         note += ", %d PCM kept" % st['skipped_codec']

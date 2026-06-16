@@ -152,10 +152,10 @@ def _swap_bank_slot(pc_bytes, ps3_bytes, exe, tmp, dry, log):
         if src is None:
             stats['skipped_nomatch'] += 1
             log("  [no-match] i=%d hash=%#010x"%(s.idx, s.hash)); continue
-        kbps = rate_to_kbps(s.rate)
+        kbps = rate_to_kbps(src.rate)     # CBR from PS3 source rate (the actual audio)
         if kbps is None:
             stats['skipped_rate'] += 1
-            log("  [skip] i=%d rate=%d (no CBR match)"%(s.idx, s.rate)); continue
+            log("  [skip] i=%d ps3_rate=%d (no CBR match)"%(s.idx, src.rate)); continue
         ip = os.path.join(tmp, "s_%08x_in.mp3"%s.hash)
         op = os.path.join(tmp, "s_%08x_cbr.mp3"%s.hash)
         open(ip,'wb').write(ps3_bytes[src.dabs:src.dabs+src.size])
@@ -163,10 +163,11 @@ def _swap_bank_slot(pc_bytes, ps3_bytes, exe, tmp, dry, log):
             packed = run_mp3packer(exe, ip, op, kbps)
         except Exception as e:
             stats['failed'] += 1; log("  [FAIL] i=%d: %s"%(s.idx, e)); continue
-        # v1: write packed straight into the slot, no strip/trim. size/nsamp untouched.
+        # v1: write packed straight into the slot, size/nsamp untouched; patch the rate
+        # field to the PS3 rate so playback pitch is right when PC/PS3 rates differ.
         warn = ""
         if src.nsamp > 2*s.size:          # PS3 audio genuinely longer than the PC slot
-            cut_ms = (src.nsamp - 2*s.size) * 1000.0 / s.rate if s.rate else 0.0
+            cut_ms = (src.nsamp - 2*s.size) * 1000.0 / src.rate if src.rate else 0.0
             stats['audio_cut'] += 1; stats['max_cut_ms'] = max(stats['max_cut_ms'], cut_ms)
             warn = "  WARNING: PS3 audio %d > slot %d samples -> ~%.0fms real tail cut" \
                    % (src.nsamp, 2*s.size, cut_ms)
@@ -179,9 +180,10 @@ def _swap_bank_slot(pc_bytes, ps3_bytes, exe, tmp, dry, log):
             out[s.dabs:s.dabs+len(w)] = w
             if len(w) < s.size:
                 out[s.dabs+len(w):s.dabs+s.size] = b'\x00'*(s.size-len(w))
+            struct.pack_into('<H', out, s.info_off + 0x18, src.rate)  # match PS3 rate
         done.add(s.dabs); stats['swapped'] += 1
-        log("  [swap] i=%d hash=%#010x rate=%d CBR%d  PS3 %dB -> MP3 %dB / slot %dB  %s%s"
-            % (s.idx, s.hash, s.rate, kbps, src.size, len(packed), s.size,
+        log("  [swap] i=%d hash=%#010x ps3_rate=%d CBR%d  PS3 %dB -> MP3 %dB / slot %dB  %s%s"
+            % (s.idx, s.hash, src.rate, kbps, src.size, len(packed), s.size,
                "trunc %dB"%(len(packed)-s.size) if len(packed)>s.size
                else "pad %dB"%(s.size-len(packed)), warn))
     return bytes(out), stats
@@ -221,10 +223,14 @@ def _swap_bank_grow(pc_bytes, ps3_bytes, exe, tmp, dry, keep_info, match_length,
         if rep.codec != 0x400:
             plan[off]=dict(data=pc_bytes[rep.dabs:rep.dabs+rep.size],size=rep.size,
                            nsamp=rep.nsamp,swapped=False); stats['skipped_codec']+=1; continue
-        src = ps3_by_hash.get(rep.hash); kbps = rate_to_kbps(rep.rate)
+        src = ps3_by_hash.get(rep.hash)
         if src is None:
             plan[off]=dict(data=pc_bytes[rep.dabs:rep.dabs+rep.size],size=rep.size,
                            nsamp=rep.nsamp,swapped=False); stats['skipped_nomatch']+=1; continue
+        # CBR + target rate come from the PS3 SOURCE rate (the actual audio), not the PC
+        # slot rate. If they differ (e.g. LRR: PC 44.1k, PS3 32k -> 44.1k has no valid CBR),
+        # we pack at the source rate and patch the bank sound's rate field below.
+        kbps = rate_to_kbps(src.rate)
         if kbps is None:
             plan[off]=dict(data=pc_bytes[rep.dabs:rep.dabs+rep.size],size=rep.size,
                            nsamp=rep.nsamp,swapped=False); stats['skipped_rate']+=1; continue
@@ -247,7 +253,8 @@ def _swap_bank_grow(pc_bytes, ps3_bytes, exe, tmp, dry, keep_info, match_length,
             packed=packed+b'\x00'*(((src.nsamp+1)//2)-mp3_bytes); stats['padded']+=1
         over=len(packed)-rep.size
         if over>0: stats['max_overflow']=max(stats['max_overflow'],over); stats['grew_by']+=over
-        plan[off]=dict(data=packed,size=len(packed),nsamp=2*len(packed),swapped=True)
+        plan[off]=dict(data=packed,size=len(packed),nsamp=2*len(packed),swapped=True,
+                       rate=src.rate)
         stats['swapped']+=1
     out=bytearray(pc_bytes[:base]); blob=bytearray()
     for off in order:
@@ -257,6 +264,7 @@ def _swap_bank_grow(pc_bytes, ps3_bytes, exe, tmp, dry, keep_info, match_length,
             if P['swapped']:
                 struct.pack_into('<I',out,s.info_off+0x0c,P['size'])
                 struct.pack_into('<I',out,s.info_off+0x10,P['nsamp'])
+                struct.pack_into('<H',out,s.info_off+0x18,P['rate'])  # match PS3 rate
     blob+=b'\x00'*((-len(blob))%align); out+=blob
     return bytes(out), stats
 
