@@ -62,7 +62,7 @@ re-frames the existing MP3 data to constant bitrate without a re-encode.
 | Part                         | State |
 |------------------------------|-------|
 | Cutscenes                    | ✅ working |
-| Radio                        | ✅ working (≈32 ms warm-up tick on tune-in, see notes) |
+| Radio                        | ✅ working (gap-free; tune-in handled by a short lead-in) |
 | Banks                        | ✅ working |
 | Radio "downgrader" (restoring removed Complete-Edition songs as MP3) | 📋 planned |
 
@@ -121,10 +121,13 @@ py tools/gta4_ps3_audio.py <pc_dir> <ps3_dir> -o <out_dir> --batch --mp3packer .
 
 ## Notes & limitations
 
-- **Radio tune-in tick (~32 ms).** Entering an MP3 stream mid-song means the first
-  frame references the bit reservoir of frames you didn't load, plus the first
-  streaming chunk is one fractional frame short. This is inherent to mid-stream MP3
-  entry; the decoder is already at the practical floor (see `MARGIN` in `dllmain.cpp`).
+- **Radio tune-in.** Entering an MP3 stream mid-song means the first streaming chunk
+  is one fractional frame short (~32 ms). Rather than letting that gap surface a
+  couple of seconds into playback, the decoder front-loads it as a short lead-in
+  (`PREROLL_SAMPLES` in `dllmain.cpp`): the stream starts ~68 ms later — inaudible,
+  hidden in the station switch — and then plays gap-free. The pre-roll is rate-gated
+  (`PREROLL_MIN_HZ`, ≥32 kHz) so it applies to radio/cutscenes but not to the
+  lower-rate one-shot speech banks, whose tails would otherwise be clipped.
 - **Speech length.** PS3 voicelines can be a few tens of ms longer than the PC slot;
   the overflow is truncated (usually trailing silence/decay, inaudible).
 - **PCM banks are kept.** PC PCM (`codec 0x1`) is lossless and already better than the
