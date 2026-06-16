@@ -40,8 +40,7 @@ PS3-MPEG uses 0x18/channel), then seek tables **0x08/entry**.
 contiguous (not frame-interleaved), `skip = 0`. Timestamps live separately and do
 **not** move `data_start`.
 
-## Non-streamed container (banks: speech, pain, radio DJ announcements)
-
+## Non-streamed container (banks)
 Header: `table = u64@0x00`, `total = u32@0x10` (sub-sound count),
 `base = u32@0x18`. **PC is little-endian, PS3 is big-endian.**
 
@@ -66,8 +65,8 @@ swap once. PC and PS3 may list sounds in different order, so always match by has
 ## The decoder insight (why naïve streaming dropped audio)
 
 The MP3, the swapped container, and the game's feed are all clean and contiguous
-(verified byte-for-byte and with upstream minimp3). The dropouts came from
-**minimp3 itself when fed in chunks**: if you let it decode the *last* frame in the
+(verified byte-for-byte and with upstream minimp3). Dropouts occur when
+**minimp3 itself is fed in chunks**: if you let it decode the *last* frame in the
 buffer before the *next* frame's header has arrived, it advances `frame_bytes` but
 returns **0 samples** (it can't validate the frame), losing ~1 frame per chunk
 boundary (~3 % silence).
