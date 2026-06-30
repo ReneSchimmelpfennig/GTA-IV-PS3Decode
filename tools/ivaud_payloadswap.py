@@ -44,6 +44,21 @@ def is_swappable(pc):
         return False
     if _ru64(pc, data_off + 8) != 0x18 + channels * 0x10:
         return False
+    # CODEC GATE: only ADPCM (0x400) is decoded by the software path we hook. A PCM (or
+    # any non-0x400) stream can share the exact same block structure, so the structural
+    # checks above are NOT enough. If we swapped MP3 into a PCM container, its codec would
+    # stay PCM and the PCM decoder would play the MP3 bytes as raw samples -> noise (the
+    # LOADINGTUNE_1 @32kHz bug). The codec lives in the channel-info struct at
+    # channel_table_offset(@0x14) + channels*0x10 + 0x1c (same field deint reads as 0x0100
+    # for MPEG). Require 0x400 here so PCM/other streams are left untouched.
+    try:
+        ch_info = _ru64(pc, 0x14) + channels * 0x10
+        if ch_info + 0x20 > len(pc):
+            return False
+        if _ru32(pc, ch_info + 0x1c) != 0x400:
+            return False
+    except struct.error:
+        return False
     return True
 
 
