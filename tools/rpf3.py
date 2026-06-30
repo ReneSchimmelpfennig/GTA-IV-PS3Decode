@@ -98,10 +98,33 @@ def rpf3_read(rpf_path, aes_key):
         raw = f.read()
 
     magic = raw[:4]
+    if magic != RPF3_MAGIC:
+        raise ValueError("not an RPF3 archive: magic=%r, expected %r" % (magic, RPF3_MAGIC))
     toc_size, entry_count, unknown, encrypted = struct.unpack_from('<IiiI', raw, 4)
+
+    # Sanity-check the little-endian header. Garbage here (huge/negative counts, an
+    # out-of-range TOC) means we are reading the header the wrong way round - almost
+    # always a big-endian PS3/360 console RPF fed to this little-endian PC reader.
+    # Without this guard the bad values cause a MemoryError (giant entry_count) or an
+    # AES "not block aligned" error further down; catch it here with a clear message.
+    plausible = (0 < toc_size <= len(raw)
+                 and 0 <= entry_count <= 1_000_000
+                 and entry_count * ENTRY_SIZE <= toc_size + ENTRY_SIZE)
+    if not plausible:
+        be_toc, be_cnt = struct.unpack_from('>Ii', raw, 4)
+        hint = ""
+        if 0 < be_toc <= len(raw) and 0 <= be_cnt <= 1_000_000:
+            hint = (" Read big-endian the header is plausible (toc=%d, entries=%d) -> this "
+                    "is a big-endian PS3/360 console RPF. This tool reads little-endian PC "
+                    "RPF3 only; use a PC (little-endian) RPF as the PS3 source." % (be_toc, be_cnt))
+        raise ValueError("RPF3 header invalid as little-endian (toc_size=%d, entry_count=%d)."
+                         "%s" % (toc_size, entry_count, hint))
 
     toc_raw = raw[TOC_START: TOC_START + toc_size]
     if encrypted:
+        if len(toc_raw) % 16 != 0:
+            raise ValueError("encrypted TOC is not 16-byte aligned (len=%d) - file is "
+                             "corrupt or not a PC RPF3." % len(toc_raw))
         toc_raw = aes_crypt(toc_raw, aes_key, encrypt=False)
 
     entries = []
@@ -138,12 +161,31 @@ def rpf3_read(rpf_path, aes_key):
 
 
 # -- writer -------------------------------------------------------------------
-def rpf3_write(rpf_out_path, rpf_info, replacements):
+def rpf3_write(rpf_out_path, rpf_info, replacements, compact=False):
     """
-    Writes a new RPF3 file. replacements: {name_hash: new_bytes}.
-    Files that are not replaced are copied unchanged.
-    2 GB safeguard: offsets >= 2 GB would be misinterpreted as a directory
-    -> in that case keep the original (warning).
+    Writes a new RPF3 file.
+
+    Two layout strategies:
+
+    * compact=False (LAYOUT-PRESERVING, for slot mode): each entry is written back
+      at its ORIGINAL byte offset. A replacement that fits its original slot is
+      written in place, so unchanged / same-size entries keep their exact offsets
+      and the file keeps its exact size. Only a genuinely larger replacement is
+      appended at the end. Good when almost nothing grows.
+
+    * compact=True (COMPACT REBUILD, for grow mode): every file is repacked densely
+      from data_start (2048-aligned), discarding the dead space the in-place+append
+      scheme would leave behind. In grow mode EVERY swapped bank is larger than its
+      slot, so the layout-preserving scheme would append all of them and leave the
+      originals as dead weight -> the archive roughly DOUBLES and large ones cross
+      the 2 GB offset limit (offsets with bit 31 set read as directories). Compacting
+      writes each entry exactly once, so the file ends up ~original size + the MP3-vs-
+      ADPCM overhead (~10-20%), staying well under 2 GB. This is safe: the crash was
+      payload > size, never the RPF layout (that was ruled out), so re-laying-out the
+      archive cannot reintroduce it.
+
+    replacements: {name_hash: new_bytes}. 2 GB safeguard: any blob that would still
+    push the file past 2 GB is kept original (offsets >= 2 GB read as directories).
     """
     entries   = rpf_info['entries']
     aes_key   = rpf_info['aes_key']
@@ -151,34 +193,66 @@ def rpf3_write(rpf_out_path, rpf_info, replacements):
     toc_size  = rpf_info['toc_size']
 
     file_entries = [e for e in entries if e['type'] == 'file']
-    data_start = align2048(TOC_START + toc_size)
+    data_start   = align2048(TOC_START + toc_size)
 
-    final_blob = {}
+    # Original end-of-data = highest (offset + padded size). This is the size we
+    # preserve; appended (oversized) blobs extend past it.
+    orig_end = data_start
+    for e in file_entries:
+        end = e['offset'] + align2048(e['size'])
+        if end > orig_end:
+            orig_end = end
+
+    # Decide placement.
+    placement  = {}     # name_hash -> (absolute_offset, blob)
     over_limit = []
-    running = data_start
-    for e in file_entries:
-        h = e['name_hash']
-        repl = replacements.get(h)
-        chosen = repl if repl is not None else e['data']
-        if running + len(chosen) >= LIMIT_2GB:
-            chosen = e['data']
-            if running + len(chosen) < LIMIT_2GB:
-                over_limit.append(e.get('name', f'hash_{h:08X}'))
-        final_blob[h] = chosen
-        running += align2048(len(chosen))
-
-    new_offsets = {}
-    data_blob = bytearray()
-    for e in file_entries:
-        h = e['name_hash']
-        blob = final_blob[h]
-        new_offsets[h] = data_start + len(data_blob)
-        data_blob += blob
-        data_blob += b'\x00' * (align2048(len(blob)) - len(blob))
+    if compact:
+        # COMPACT REBUILD: repack every file densely from data_start, in original-offset
+        # order (keeps relative locality), discarding all dead space.
+        cur = data_start
+        for e in sorted(file_entries, key=lambda e: e['offset']):
+            h = e['name_hash']
+            blob = replacements.get(h)
+            if blob is None:
+                blob = e['data']
+            elif cur + align2048(len(blob)) >= LIMIT_2GB:
+                # Extremely unlikely once compacted, but if even this layout would cross
+                # 2 GB, fall back to the smaller original (ADPCM) for this one entry.
+                blob = e['data']; over_limit.append(e.get('name', f"hash_{h:08X}"))
+            placement[h] = (cur, blob)
+            cur += align2048(len(blob))
+        total = cur
+    else:
+        # LAYOUT-PRESERVING: in-place when the blob fits its original slot; otherwise the
+        # replacement grew and is appended at the end (slot left as dead space).
+        append_list = []
+        for e in file_entries:
+            h    = e['name_hash']
+            repl = replacements.get(h)
+            if repl is not None and len(repl) > e['size']:
+                append_list.append((e, repl))
+            else:
+                placement[h] = (e['offset'], repl if repl is not None else e['data'])
+        total = orig_end
+        for e, blob in append_list:
+            h = e['name_hash']
+            if total + len(blob) >= LIMIT_2GB:          # would cross 2 GB -> keep original
+                placement[h] = (e['offset'], e['data'])
+                over_limit.append(e.get('name', f"hash_{h:08X}"))
+                continue
+            placement[h] = (total, blob)
+            total += align2048(len(blob))
 
     if over_limit:
-        print(f"    [!] {len(over_limit)} files over the 2 GB boundary - keeping original. RPF split needed.")
+        print(f"    [!] {len(over_limit)} files would cross the 2 GB boundary - kept original.")
 
+    # Build the whole file image at the preserved size and overlay each entry at
+    # its absolute offset. Entries never overlap header/TOC (offsets >= data_start).
+    buf = bytearray(total)
+    for h, (offset, blob) in placement.items():
+        buf[offset:offset + len(blob)] = blob       # surrounding padding stays zero
+
+    # TOC: original offset/size for every entry, updated only where we changed it.
     toc_data = bytearray(toc_size)
     for e in entries:
         off = e['index'] * ENTRY_SIZE
@@ -188,9 +262,9 @@ def rpf3_write(rpf_out_path, rpf_info, replacements):
                              e['name_hash'], e['content_count'], d2, e['unknown'])
         else:
             h = e['name_hash']
-            blob = final_blob[h]
+            offset, blob = placement[h]
             struct.pack_into('<IIII', toc_data, off,
-                             h, len(blob), new_offsets[h], e['unknown'])
+                             h, len(blob), offset, e['unknown'])
 
     toc_enc = aes_crypt(bytes(toc_data), aes_key, encrypt=True) if encrypted else bytes(toc_data)
 
@@ -198,12 +272,12 @@ def rpf3_write(rpf_out_path, rpf_info, replacements):
                          rpf_info['entry_count'], rpf_info['unknown'],
                          rpf_info['encrypted'])
 
+    # Overlay header + TOC into the image, then write it out in one piece.
+    buf[0:len(header)] = header
+    buf[TOC_START:TOC_START + len(toc_enc)] = toc_enc
+
     with open(rpf_out_path, 'wb') as f:
-        f.write(header)
-        f.write(b'\x00' * (TOC_START - len(header)))
-        f.write(toc_enc)
-        f.write(b'\x00' * (data_start - TOC_START - len(toc_enc)))
-        f.write(data_blob)
+        f.write(buf)
 
 
 # -- self test ----------------------------------------------------------------
