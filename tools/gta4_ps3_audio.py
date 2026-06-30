@@ -40,9 +40,10 @@ def _pc_rate(pc):
     return struct.unpack_from('<I', pc, table_off + 0x04)[0]
 
 
-def repack_cbr(mp3_bytes, bitrate, exe):
-    """Losslessly pack to CBR <bitrate> (mp3packer, no re-encode)."""
-    with tempfile.TemporaryDirectory() as td:
+def repack_cbr(mp3_bytes, bitrate, exe, tmp_base=None):
+    """Losslessly pack to CBR <bitrate> (mp3packer, no re-encode). Temp files go under
+    tmp_base (the output-folder scratch dir) so one AV exclusion covers everything."""
+    with tempfile.TemporaryDirectory(dir=tmp_base) as td:
         inp = os.path.join(td, "in.mp3")
         outp = os.path.join(td, "out.mp3")
         with open(inp, 'wb') as f:
@@ -84,9 +85,27 @@ def _is_strict_cbr(mp3_bytes):
     return len(sz) < 2 or len(set(sz)) == 1
 
 
-def _process_bank(pc_data, ps3_data, mp3packer):
-    """Non-streamed speech/pain bank: per-sound payload swap, grow mode (rebuild the
-    data region to fit each whole MP3; the leading Info/Xing frame is stripped)."""
+def _process_bank(pc_data, ps3_data, mp3packer, tmp_base, grow=True):
+    """Non-streamed speech/pain bank: per-sound payload swap in GROW mode.
+
+    Grow mode rebuilds the audio-data region so each swapped sound gets a slot sized
+    to its whole MP3 (lead-in + audio + trailing), rewrites that sound's size /
+    sample-count / data-offset / rate fields, and shifts the later data offsets; the
+    header, sub-sound table and per-sound info structs (everything before `base`) keep
+    their positions, so the loader's binary search over the table (image 0x887DA0 /
+    RVA 0x487DCC) still works. The output bank is larger than the input - that is
+    expected and fine.
+
+    The long-hunted crash was NOT caused by relayout: it was the MP3 payload being
+    LARGER than the unchanged `size` field, so the engine's load buffer (sized from
+    `size`) overran the neighbouring bank object. Grow mode sets `size` to the real
+    payload length, so the buffer fits exactly and cannot overflow. (Slot mode avoided
+    the overflow by clamping the MP3 to the padded slot, but the encoder lead-in then
+    displaced the real tail off the `size`-byte decode window -> voice lines clipped at
+    the end. Grow keeps the whole payload, so the ASI decodes all of it and only the
+    silent lead-in is trimmed at playback.) The CBR is matched to the PS3 source rate
+    (sample_rate*4 kbps == the ADPCM byte rate) and the leading Info/Xing frame is
+    stripped; the per-sound rate field is patched to the source rate for correct pitch."""
     try:
         pcb = bank_swap.parse_bank(pc_data)
     except Exception as e:
@@ -95,26 +114,36 @@ def _process_bank(pc_data, ps3_data, mp3packer):
        or pcb['base'] >= len(pc_data):
         return None, "skip: implausible bank header"
     try:
-        with tempfile.TemporaryDirectory() as td:
-            out, st = bank_swap.swap_bank(pc_data, ps3_data, mp3packer, grow=True,
+        # Per-bank scratch dir lives INSIDE tmp_base (under the output folder), not in the
+        # system temp, so a single Defender exclusion on the output folder covers it. Still
+        # auto-deleted per bank.
+        with tempfile.TemporaryDirectory(dir=tmp_base) as td:
+            out, st = bank_swap.swap_bank(pc_data, ps3_data, mp3packer, grow=grow,
                                           tmpdir=td, log=lambda *a, **k: None)
     except Exception as e:
         return None, "skip: bank-swap error (%s)" % e
     if st['swapped'] == 0:
         return None, "skip: bank, nothing swappable (%d PCM, %d no-match, %d rate)" \
                      % (st['skipped_codec'], st['skipped_nomatch'], st['skipped_rate'])
-    note = "BANK ok  %d sounds" % st['swapped']
+    note = "BANK ok  %d sounds (%s +%dB)" % (st['swapped'],
+                                             "grow" if grow else "slot", st.get('grew_by', 0))
     if st['skipped_codec']:
         note += ", %d PCM kept" % st['skipped_codec']
     if st['skipped_nomatch']:
         note += ", %d no-match" % st['skipped_nomatch']
+    if st.get('skipped_rate'):
+        note += ", %d rate-skip" % st['skipped_rate']
+    if st.get('failed'):
+        note += ", %d FAILED (timeout/err -> kept ADPCM)" % st['failed']
+    if st.get('info_stripped'):
+        note += ", %d info-frame stripped" % st['info_stripped']
     return bytes(out), note
 
 
-def process_ivaud(pc_data, ps3_data, cbr, mp3packer):
+def process_ivaud(pc_data, ps3_data, cbr, mp3packer, tmp_base, grow=True):
     # Non-streamed bank? (streamCount field @0x10 != 0) -> per-sound bank swap.
     if len(pc_data) >= 0x30 and struct.unpack_from('<I', pc_data, 0x10)[0] != 0:
-        return _process_bank(pc_data, ps3_data, mp3packer)
+        return _process_bank(pc_data, ps3_data, mp3packer, tmp_base, grow=grow)
 
     if not swap.is_swappable(pc_data):
         return None, "skip: PC is not a streamed ADPCM ivaud"
@@ -139,7 +168,7 @@ def process_ivaud(pc_data, ps3_data, cbr, mp3packer):
 
     # --- LOSSLESS pack to CBR <cbr> (byte = time) ---
     try:
-        mp3 = [repack_cbr(m, cbr, mp3packer) for m in mp3]
+        mp3 = [repack_cbr(m, cbr, mp3packer, tmp_base) for m in mp3]
     except Exception as e:
         return None, "ERROR: mp3packer (%s)" % e
 
@@ -180,8 +209,8 @@ def process_ivaud(pc_data, ps3_data, cbr, mp3packer):
     return out, note + warn
 
 
-def process_rpf(key, pc_rpf, ps3_rpf, out_rpf, cbr, mp3packer,
-                dry_run=False, quiet=False):
+def process_rpf(key, pc_rpf, ps3_rpf, out_rpf, cbr, mp3packer, tmp_base,
+                dry_run=False, quiet=False, grow=True):
     pc_info  = rpf3.rpf3_read(pc_rpf, key)
     ps3_info = rpf3.rpf3_read(ps3_rpf, key)
     ps3_by_hash = {e['name_hash']: e for e in ps3_info['entries'] if e['type'] == 'file'}
@@ -194,7 +223,7 @@ def process_rpf(key, pc_rpf, ps3_rpf, out_rpf, cbr, mp3packer,
         ps3e = ps3_by_hash.get(e['name_hash'])
         if ps3e is None:
             n_nops3 += 1; continue
-        new, status = process_ivaud(e['data'], ps3e['data'], cbr, mp3packer)
+        new, status = process_ivaud(e['data'], ps3e['data'], cbr, mp3packer, tmp_base, grow=grow)
         if new is not None:
             replacements[e['name_hash']] = new
             n_swapped += 1
@@ -206,7 +235,11 @@ def process_rpf(key, pc_rpf, ps3_rpf, out_rpf, cbr, mp3packer,
                 print("  [skip] %-28s %s" % (e['name'], status))
 
     if not dry_run and replacements:
-        rpf3.rpf3_write(out_rpf, pc_info, replacements)
+        # Grow mode grows every swapped bank -> compact (dense repack) so the archive
+        # doesn't ~double and cross the 2 GB offset limit. Slot mode keeps every bank at
+        # its original size, so the layout-preserving (in-place) write is correct and the
+        # file stays byte-for-byte the original size where unchanged.
+        rpf3.rpf3_write(out_rpf, pc_info, replacements, compact=grow)
 
     return dict(swapped=n_swapped, skipped=n_skipped, no_ps3=n_nops3,
                 total=len([e for e in pc_info['entries'] if e['type'] == 'file']),
@@ -222,7 +255,22 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--mp3packer", default=MP3PACKER_DEFAULT, help="path to mp3packer")
     ap.add_argument("--cbr", type=int, default=128, help="CBR bitrate kbps (default 128 = ADPCM rate)")
+    ap.add_argument("--lead-in", type=int, default=bank_swap.LEAD_IN_SAMPLES,
+                    help="leading encoder/decoder lead-in samples stripped from each MP3 "
+                         "(whole frames, lossless; default %d, 0 disables). Removing it keeps "
+                         "banks inside their wave-slot (no crash) and removes the slot-mode "
+                         "end-clip." % bank_swap.LEAD_IN_SAMPLES)
+    ap.add_argument("--slot", action="store_true",
+                    help="SLOT mode: keep every bank at its original size (clamp MP3 to the "
+                         "padded slot) and write the RPF layout-preserving (no compaction). "
+                         "Diagnostic / fallback - voice lines may clip at the end. Default is "
+                         "GROW mode (full payload, larger banks, compacted RPF).")
+    ap.add_argument("--tmpdir", default=None,
+                    help="scratch folder for mp3packer temp files (default: <out>/_gta4mp3_tmp). "
+                         "Put this (or the output folder) in your AV exclusions to avoid "
+                         "real-time-scan locks slowing the run.")
     args = ap.parse_args()
+    bank_swap.LEAD_IN_SAMPLES = args.lead_in   # file-level lead-in trim (see bank_swap.drop_lead_in)
 
     # check mp3packer availability
     try:
@@ -234,10 +282,25 @@ def main():
     print("AES key from", args.exe, "...")
     key = rpf3.extract_aes_key(args.exe)
 
+    # Fixed scratch folder under the output location (not the system temp), so ONE Defender
+    # exclusion on the output folder covers both the temp files and the finished RPFs.
+    if args.tmpdir:
+        tmp_base = args.tmpdir
+    elif args.batch:
+        tmp_base = os.path.join(args.out, "_gta4mp3_tmp")
+    else:
+        tmp_base = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".", "_gta4mp3_tmp")
+    os.makedirs(tmp_base, exist_ok=True)
+    print("Temp folder:", tmp_base, "(add this or the output folder to your AV exclusions)")
+
+    grow = not args.slot
+    print("Mode:", "GROW (full payload, compacted RPF)" if grow
+          else "SLOT (original sizes, layout-preserving) [diagnostic]")
+
     if not args.batch:
         print("Processing: %s + %s  (CBR %d)" % (os.path.basename(args.pc), os.path.basename(args.ps3), args.cbr))
         st = process_rpf(key, args.pc, args.ps3, args.out, args.cbr, args.mp3packer,
-                         dry_run=args.dry_run, quiet=args.quiet)
+                         tmp_base, dry_run=args.dry_run, quiet=args.quiet, grow=grow)
         print("\nDone: %d swapped, %d skipped, %d without PS3 (of %d)"
               % (st['swapped'], st['skipped'], st['no_ps3'], st['total']))
         if st['wrote']: print("Written:", args.out)
@@ -260,7 +323,7 @@ def main():
         try:
             st = process_rpf(key, os.path.join(args.pc, fn), os.path.join(args.ps3, m),
                              os.path.join(args.out, fn), args.cbr, args.mp3packer,
-                             dry_run=args.dry_run, quiet=args.quiet)
+                             tmp_base, dry_run=args.dry_run, quiet=args.quiet, grow=grow)
         except Exception as e:
             print("  ERROR:", e)
             if not args.quiet: traceback.print_exc()
