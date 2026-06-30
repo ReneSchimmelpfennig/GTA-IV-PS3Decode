@@ -91,6 +91,11 @@ These tools are included and used to create Frankenstein RPFs that contain PS3 a
 - `tools/rpf3.py` — RPF3 reader/writer + AES key extraction
 - `tools/rage_aud_deinterleave.py` — PS3 ivaud → per-channel mono MP3
 - `tools/ivaud_payloadswap.py` — byte-exact payload swap
+- `tools/bank_swap.py` — bank (per sub-sound) payload swap
+- `tools/slotcheck.py` — QA analyzer for a converted RPF: flags any swapped sound that
+  would play as noise (first-frame fits the slot, sync chain intact, rate consistent),
+  with an optional byte-diff against the original RPF to tell a broken swap from an
+  untouched ADPCM sound
 - `tools/hashes.txt` — RPF name-hash table
 
 Third-party dependencies you must place in `asi/` to build:
@@ -129,7 +134,10 @@ py tools/gta4_ps3_audio.py <pc_dir> <ps3_dir> -o <out_dir> --batch --mp3packer .
   (`PREROLL_MIN_HZ`, ≥32 kHz) so it applies to radio/cutscenes but not to the
   lower-rate one-shot speech banks, whose tails would otherwise be clipped.
 - **Speech length.** PS3 voicelines can be a few tens of ms longer than the PC slot;
-  the overflow is truncated (usually trailing silence/decay, inaudible).
+  the overflow is truncated (usually trailing silence/decay, inaudible). Very short
+  one-shot lines (e.g. effort grunts) are decoded frame-by-frame, so they are detected
+  and played correctly instead of falling back to ADPCM noise — minimp3's normal call
+  refuses to confirm a frame when the read window's tail is neighbouring-sound bytes.
 - **PCM banks are kept.** PC PCM (`codec 0x1`) is lossless and already better than the
   PS3 MP3 equivalent, so the bank converter skips anything that isn't ADPCM
   (`codec 0x400`).
