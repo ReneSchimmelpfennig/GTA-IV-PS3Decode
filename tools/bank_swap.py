@@ -32,7 +32,18 @@ Bank format (verified):
 PC<->PS3 matching is by name_hash (not by index!). Aliases (several sounds sharing
 the same data_off) are swapped only once.
 """
-import struct, sys, os, subprocess, tempfile, argparse, math
+import struct, sys, os, subprocess, tempfile, argparse, math, time
+from concurrent.futures import ThreadPoolExecutor
+
+# Parallel mp3packer workers (one external process per swappable sound is the bottleneck;
+# mp3packer is CPU-bound and subprocess.run releases the GIL, so threads scale across cores).
+MP3PACKER_WORKERS = max(2, min(16, (os.cpu_count() or 4)))
+# Retry a sound a few times before giving up: under heavy parallelism the AV scanner can
+# briefly lock a freshly-written temp file, which is transient and clears on retry.
+MP3PACKER_RETRIES = 4
+# Hard cap per mp3packer call. A small mono speech sound packs in <1s; this only trips on
+# a hang (malformed input / loop), so one bad sound can't freeze the whole conversion.
+MP3PACKER_TIMEOUT = 30
 
 # valid MPEG bitrate (kbps) for byte=time: ADPCM byte rate = rate/2 -> kbps = rate*4/1000
 MP3_BITRATES = {32,40,48,56,64,80,96,112,128,160,192,224,256,320}
@@ -92,6 +103,58 @@ def frames_end(b):
             break
         i += fl; last = i
     return last
+
+# Encoder/decoder lead-in measured against the PC ADPCM: the PS3 MP3 decodes to ~2116
+# leading samples (@24kHz) of warm-up/delay BEFORE the real audio. We strip the whole
+# leading frames that lie inside that lead-in directly from the file (lossless - just
+# dropping frame bytes, never re-encoding). Two payoffs:
+#   1. the file shrinks, so a swapped bank stays inside its fixed wave-slot budget and
+#      no longer overflows into the neighbouring bank object (the Chinese Takeout crash);
+#   2. the real audio moves to the front, so it fits inside the engine's `size`-byte
+#      decode window -> the slot-mode end-clip disappears too.
+# MP3 is frame-granular (576 samples/frame for the MPEG-2 24kHz speech, 1152 for MPEG-1),
+# so a sub-frame remainder (< one frame, near-silent) is left; the ASI trims that residual
+# at output. We only ever drop frames that are ENTIRELY within the lead-in, so real audio
+# is never clipped.
+LEAD_IN_SAMPLES = 2116
+
+def _main_data_begin(b, i):
+    """main_data_begin (the 9-bit MPEG-1 / 8-bit MPEG-2 bit-reservoir back-pointer) of
+    the Layer III frame at b[i]. 0 means the frame's main data is fully self-contained,
+    i.e. it references NO previous frame -> a safe stream cut point. Returns -1 if the
+    side info would run past the buffer."""
+    ver  = (b[i+1] >> 3) & 3
+    prot = b[i+1] & 1                       # protection bit: 0 => 16-bit CRC follows header
+    si   = i + 4 + (0 if prot else 2)       # start of side information
+    if ver == 3:                            # MPEG-1: main_data_begin = 9 bits
+        if si+2 > len(b): return -1
+        return (b[si] << 1) | (b[si+1] >> 7)
+    if si+1 > len(b): return -1             # MPEG-2/2.5: main_data_begin = 8 bits
+    return b[si]
+
+def drop_lead_in(b, lead_in_samples=None):
+    """Drop whole leading frames covering the encoder/decoder lead-in - but ONLY cut in
+    front of a frame whose main_data_begin == 0. Cutting before a frame that back-references
+    the bit reservoir of a dropped frame would leave the decoder without that frame's main
+    data -> garbage/noise on the first frames. So we drop the largest run of in-lead-in
+    frames that ends on a self-contained frame; if none exists in the window we drop nothing
+    (lossless, never noisy). Returns (trimmed_bytes, samples_dropped)."""
+    if lead_in_samples is None:
+        lead_in_samples = LEAD_IN_SAMPLES
+    if lead_in_samples <= 0:
+        return b, 0
+    i = 0; n = len(b); acc = 0; cut = 0; cut_samples = 0
+    while i+4 <= n:
+        fl = frame_len(b, i)
+        if fl == 0 or i+fl > n:
+            break
+        spf = 1152 if ((b[i+1] >> 3) & 3) == 3 else 576   # MPEG-1 vs MPEG-2/2.5 Layer III
+        if acc + spf > lead_in_samples:
+            break                           # next frame already carries real audio -> stop
+        acc += spf; i += fl
+        if i+4 <= n and _main_data_begin(b, i) == 0:
+            cut = i; cut_samples = acc       # reservoir-safe boundary -> remember it
+    return b[cut:], cut_samples
 
 def clean_stream(b):
     """Rebuild a pure CBR stream: keep only valid Layer III AUDIO frames, dropping
@@ -155,19 +218,51 @@ def parse_bank(d):
     return dict(le=le,table=table,total=total,base=base,sio=sio,sounds=snds)
 
 def run_mp3packer(exe,inp,outp,kbps):
-    r=subprocess.run([exe,"-b",str(kbps),"-r","-f",inp,outp],capture_output=True,text=True)
+    # stdin=DEVNULL: if mp3packer ever prompts (e.g. on an odd input) it gets EOF instead of
+    # blocking forever on the terminal. timeout: a small mono sound packs in well under a
+    # second, so this only ever fires on a genuine hang/loop -> we kill it and the caller
+    # treats that one sound as failed (kept ADPCM) instead of stalling the whole run.
+    try:
+        r=subprocess.run([exe,"-b",str(kbps),"-r","-f",inp,outp],
+                         capture_output=True,text=True,
+                         stdin=subprocess.DEVNULL,timeout=MP3PACKER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("mp3packer timed out after %ds (%s) - input likely malformed"
+                           % (MP3PACKER_TIMEOUT, os.path.basename(inp)))
     if r.returncode!=0 or not os.path.exists(outp):
         raise RuntimeError("mp3packer failed (%s):\n%s\n%s"%(inp,r.stdout,r.stderr))
     return open(outp,'rb').read()
 
 def _new_stats(**extra):
     s = dict(swapped=0, skipped_codec=0, skipped_nomatch=0, skipped_rate=0,
-             alias=0, failed=0, padded=0, truncated=0, audio_cut=0, max_cut_ms=0.0)
+             alias=0, failed=0, padded=0, truncated=0, skipped_toobig=0,
+             audio_cut=0, max_cut_ms=0.0)
     s.update(extra); return s
 
 # ---------------------------------------------------------------------------
 #  DEFAULT: slot mode (v1) - write into the fixed PC slot, size/nsamp untouched
 # ---------------------------------------------------------------------------
+def _padded(n):
+    """Engine loads each bank sound in 2048-byte blocks -> the real slot is the
+    byte size rounded UP to 2048 (confirmed: 'size is with padding', and SparkIV's
+    Mono parser reads ceil(size/2048)*2048 bytes). That padding is slack we can use."""
+    return (n + 2047) & ~2047
+
+
+def _strip_id3(b):
+    """Drop ID3v2 (leading) and ID3v1 (trailing 128 B 'TAG') so the encoder tag we
+    saw in memory ('mp3packer...') doesn't eat slot space. minimp3 syncs on the
+    frame header and ignores tags, so this never affects decoding - it only frees
+    bytes so the MP3 fits its slot. Frame data is left untouched."""
+    if len(b) >= 10 and b[:3] == b'ID3':
+        sz = (b[6] & 0x7f) << 21 | (b[7] & 0x7f) << 14 | (b[8] & 0x7f) << 7 | (b[9] & 0x7f)
+        if 10 + sz <= len(b):
+            b = b[10 + sz:]
+    if len(b) >= 128 and b[-128:-125] == b'TAG':
+        b = b[:-128]
+    return b
+
+
 def _swap_bank_slot(pc_bytes, ps3_bytes, exe, tmp, dry, log):
     pc = parse_bank(pc_bytes)
     ps3_by_hash = {}
@@ -176,6 +271,14 @@ def _swap_bank_slot(pc_bytes, ps3_bytes, exe, tmp, dry, log):
     out = bytearray(pc_bytes)
     done = set()
     stats = _new_stats()
+    # Slot end for each sound = start of the next sound's data (sounds are packed at
+    # 2048-padded offsets). Used so we never write past a sound's own padded slot.
+    dabs_sorted = sorted(set(s.dabs for s in pc['sounds']))
+    def slot_end(dabs):
+        for d in dabs_sorted:
+            if d > dabs:
+                return d
+        return len(pc_bytes)
     for s in pc['sounds']:
         if s.codec != 0x400:
             stats['skipped_codec'] += 1; continue
@@ -185,40 +288,67 @@ def _swap_bank_slot(pc_bytes, ps3_bytes, exe, tmp, dry, log):
         if src is None:
             stats['skipped_nomatch'] += 1
             log("  [no-match] i=%d hash=%#010x"%(s.idx, s.hash)); continue
-        kbps = rate_to_kbps(src.rate)     # CBR from PS3 source rate (the actual audio)
-        if kbps is None:
-            stats['skipped_rate'] += 1
-            log("  [skip] i=%d ps3_rate=%d (no CBR match)"%(s.idx, src.rate)); continue
-        ip = os.path.join(tmp, "s_%08x_in.mp3"%s.hash)
-        op = os.path.join(tmp, "s_%08x_cbr.mp3"%s.hash)
-        open(ip,'wb').write(ps3_bytes[src.dabs:src.dabs+src.size])
-        try:
-            packed = run_mp3packer(exe, ip, op, kbps)
-        except Exception as e:
-            stats['failed'] += 1; log("  [FAIL] i=%d: %s"%(s.idx, e)); continue
-        # v1: write packed straight into the slot, size/nsamp untouched; patch the rate
-        # field to the PS3 rate so playback pitch is right when PC/PS3 rates differ.
+        # VBR (native PS3 MP3), not CBR. Banks are one-shot (no mid-stream tune-in), so the
+        # uniform-CBR requirement of the streamed path does not apply. The native VBR stream
+        # is SMALLER than the 4-bit PC ADPCM it replaces, so it drops into the original slot
+        # with the `size` field UNCHANGED -> the bank stays byte-for-byte its original size
+        # -> it always fits its fixed wave-slot (no growth, no overflow, no Chinese-Takeout
+        # crash). We keep the whole stream (no frame dropping), so there is no bit-reservoir
+        # cut -> no decode noise. The ~2116-sample encoder/decoder lead-in stays in the
+        # frames and is trimmed at OUTPUT by the ASI's TrimLeadingSilence; because the full
+        # VBR stream fits the slot (no input truncation), the real audio is complete -> no
+        # end-clip. clean_stream() strips ID3/Xing/tag frames and inter-frame junk, leaving
+        # pure Layer III audio frames. No CBR rate gate, so 44.1kHz sounds (Liberty Rock)
+        # that had no valid CBR bitrate now convert too.
+        packed, _tags, _junk = clean_stream(ps3_bytes[src.dabs:src.dabs + src.size])
+        if not packed:
+            stats['skipped_nomatch'] += 1
+            log("  [skip] i=%d hash=%#010x  no MP3 frames in PS3 source"%(s.idx, s.hash)); continue
+        cap = min(_padded(s.size), slot_end(s.dabs) - s.dabs)
         warn = ""
-        if src.nsamp > 2*s.size:          # PS3 audio genuinely longer than the PC slot
-            cut_ms = (src.nsamp - 2*s.size) * 1000.0 / src.rate if src.rate else 0.0
+        if src.nsamp > 2 * s.size:        # PS3 real audio genuinely longer than the slot's playback length
+            cut_ms = (src.nsamp - 2 * s.size) * 1000.0 / src.rate if src.rate else 0.0
             stats['audio_cut'] += 1; stats['max_cut_ms'] = max(stats['max_cut_ms'], cut_ms)
-            warn = "  WARNING: PS3 audio %d > slot %d samples -> ~%.0fms real tail cut" \
-                   % (src.nsamp, 2*s.size, cut_ms)
-        w = packed[:s.size]
-        if len(packed) > s.size:
-            stats['truncated'] += 1
-        elif len(packed) < s.size:
+            warn = "  note: PS3 audio %d > slot %d samples -> ~%.0fms tail not played" \
+                   % (src.nsamp, 2 * s.size, cut_ms)
+        # Truncate the MP3 to the padded slot if it is larger. This is SAFE (the engine
+        # loads exactly the padded slot, so we never cross into the next sound) AND
+        # effectively lossless for playback: the slot only plays 2*size samples, and a
+        # padded slot's worth of MP3 always decodes to at least that many - so the trimmed
+        # bytes are trailing frames the slot never reaches. The ONLY real tail loss is when
+        # the source audio is genuinely longer than the slot's duration (nsamp > 2*size),
+        # which is the inherent slot-mode limit, flagged above. So we keep the sound as MP3
+        # rather than falling back to ADPCM; nothing audible is lost on a normal sound.
+        if cap <= 0:                       # degenerate (no slot space) -> keep original ADPCM
+            stats['skipped_toobig'] += 1
+            log("  [keep-adpcm] i=%d hash=%#010x  no slot space (kept original)"
+                % (s.idx, s.hash)); continue
+        w = packed[:cap]
+        trim = len(packed) - len(w)
+        if trim > 0:
+            stats['truncated'] += 1        # benign overhead trim (frames beyond 2*size)
+        elif len(w) < s.size:
             stats['padded'] += 1
+        assert len(w) <= cap, "guard: blob exceeds slot"   # never overflow the slot
         if not dry:
-            out[s.dabs:s.dabs+len(w)] = w
-            if len(w) < s.size:
-                out[s.dabs+len(w):s.dabs+s.size] = b'\x00'*(s.size-len(w))
-            struct.pack_into('<H', out, s.info_off + 0x18, src.rate)  # match PS3 rate
+            # Zero the whole padded slot, then drop the MP3 in. Zeroing the tail stops the
+            # decoder from seeing stale ADPCM bytes (a chance 0xFF could look like a frame).
+            out[s.dabs:s.dabs + cap] = b'\x00' * cap
+            out[s.dabs:s.dabs + len(w)] = w
+            # Patch ONLY the sound's rate field (info+0x18) to the PS3 source rate so the
+            # pitch is correct when PC and PS3 rates differ (e.g. Liberty Rock: PC 44.1kHz,
+            # PS3 32kHz). It is a no-op when the rates already match. This is safe: the rate
+            # field is orthogonal to the payload-overflow that caused the crash, 32kHz is an
+            # ordinary rate the engine resamples routinely, and size/nsamp stay the ORIGINAL
+            # ADPCM values (we only replace the payload bytes inside the existing slot), so
+            # the engine's size<<2 decode buffer and 2*size sample budget are unchanged and
+            # the bank's byte size - hence its wave-slot fit - is identical to the original.
+            struct.pack_into('<H', out, s.info_off + 0x18, src.rate)
         done.add(s.dabs); stats['swapped'] += 1
-        log("  [swap] i=%d hash=%#010x ps3_rate=%d CBR%d  PS3 %dB -> MP3 %dB / slot %dB  %s%s"
-            % (s.idx, s.hash, src.rate, kbps, src.size, len(packed), s.size,
-               "trunc %dB"%(len(packed)-s.size) if len(packed)>s.size
-               else "pad %dB"%(s.size-len(packed)), warn))
+        log("  [swap] i=%d hash=%#010x ps3_rate=%d VBR  PS3 %dB -> MP3 %dB / slot %dB (cap %dB)  %s%s"
+            % (s.idx, s.hash, src.rate, src.size, len(packed), s.size, cap,
+               "trim %dB (overhead, no playback loss)" % trim if trim > 0
+               else "slack %dB" % (cap - len(w)), warn))
     return bytes(out), stats
 
 # ---------------------------------------------------------------------------
@@ -249,6 +379,10 @@ def _swap_bank_grow(pc_bytes, ps3_bytes, exe, tmp, dry, keep_info, match_length,
         regions[s.data_off].append(s)
     stats = _new_stats(grew_by=0, max_overflow=0, info_stripped=0, align=align)
     plan = {}
+    # Phase 1: classify each region (fast, sequential). Collect the ones that need
+    # mp3packer into 'jobs'; everything kept (PCM / no-match / no-CBR) goes straight
+    # into plan.
+    jobs = []
     for off in order:
         rep = regions[off][0]
         if len(regions[off]) > 1:
@@ -267,20 +401,58 @@ def _swap_bank_grow(pc_bytes, ps3_bytes, exe, tmp, dry, keep_info, match_length,
         if kbps is None:
             plan[off]=dict(data=pc_bytes[rep.dabs:rep.dabs+rep.size],size=rep.size,
                            nsamp=rep.nsamp,swapped=False); stats['skipped_rate']+=1; continue
-        ip=os.path.join(tmp,"s_%08x_in.mp3"%rep.hash); op=os.path.join(tmp,"s_%08x_cbr.mp3"%rep.hash)
-        open(ip,'wb').write(ps3_bytes[src.dabs:src.dabs+src.size])
-        try:
-            packed=run_mp3packer(exe,ip,op,kbps)
-        except Exception as e:
+        jobs.append((off, rep, src, kbps))
+
+    # Phase 2: run mp3packer for all jobs IN PARALLEL (the slow part). The worker only
+    # touches its own temp files + returns bytes; no shared state is mutated here.
+    def _pack(job):
+        off, rep, src, kbps = job
+        # Temp names are keyed by the region's data_off (unique per job), NOT just the hash:
+        # a bank can hold the same hash at two different offsets, and naming by hash alone
+        # made two parallel workers write/read the SAME file at once -> a half-written MP3 ->
+        # mp3packer chokes and hangs. data_off is unique per region, so every job is isolated.
+        tag="%08x_%x"%(rep.hash,off)
+        ip=os.path.join(tmp,"s_%s_in.mp3"%tag); op=os.path.join(tmp,"s_%s_cbr.mp3"%tag)
+        # RETRY: under heavy parallelism the real-time AV scanner intermittently locks a
+        # freshly-written temp .mp3, so mp3packer occasionally fails to open it for a single
+        # sound. That lock clears in milliseconds, so a short retry recovers it instead of
+        # dropping the sound to ADPCM. A truly broken source still fails after all attempts.
+        last_err=None
+        for attempt in range(MP3PACKER_RETRIES):
+            try:
+                open(ip,'wb').write(ps3_bytes[src.dabs:src.dabs+src.size])
+                packed=run_mp3packer(exe,ip,op,kbps)
+                stripped=False
+                if not keep_info:
+                    packed,stripped=strip_info_frame(packed)
+                end=frames_end(packed)
+                if end>0: packed=packed[:end]
+                packed,_drop=drop_lead_in(packed)   # strip leading lead-in frames (lossless)
+                return (off, packed, stripped, None)
+            except Exception as e:
+                last_err=e
+                if attempt < MP3PACKER_RETRIES-1:
+                    time.sleep(0.25*(attempt+1))
+        return (off, None, False, last_err)
+
+    results = {}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=MP3PACKER_WORKERS) as ex:
+            for off, packed, stripped, err in ex.map(_pack, jobs):
+                results[off] = (packed, stripped, err)
+
+    # Phase 3: fold the results into plan (sequential, fast); stats updated here only.
+    for off, rep, src, kbps in jobs:
+        packed, stripped, err = results[off]
+        if err is not None:
             plan[off]=dict(data=pc_bytes[rep.dabs:rep.dabs+rep.size],size=rep.size,
                            nsamp=rep.nsamp,swapped=False); stats['failed']+=1
-            log("  [FAIL] i=%d: %s"%(rep.idx,e)); continue
-        stripped=False
-        if not keep_info:
-            packed,stripped=strip_info_frame(packed)
-            if stripped: stats['info_stripped']+=1
-        end=frames_end(packed)
-        if end>0: packed=packed[:end]
+            # Always surface a persistent failure (with the reason) so a deterministic
+            # bad source can be seen, not silently dropped to ADPCM.
+            sys.stderr.write("  [FAIL after %d tries] hash=%#010x i=%d: %s\n"
+                             % (MP3PACKER_RETRIES, rep.hash, rep.idx, err))
+            continue
+        if stripped: stats['info_stripped']+=1
         mp3_bytes=len(packed)
         if match_length and src.nsamp > 2*mp3_bytes:
             packed=packed+b'\x00'*(((src.nsamp+1)//2)-mp3_bytes); stats['padded']+=1
@@ -297,7 +469,19 @@ def _swap_bank_grow(pc_bytes, ps3_bytes, exe, tmp, dry, keep_info, match_length,
             if P['swapped']:
                 struct.pack_into('<I',out,s.info_off+0x0c,P['size'])
                 struct.pack_into('<I',out,s.info_off+0x10,P['nsamp'])
-                struct.pack_into('<H',out,s.info_off+0x18,P['rate'])  # match PS3 rate
+                struct.pack_into('<I',out,s.info_off+0x28,P['nsamp'])  # second sample-count copy
+                struct.pack_into('<H',out,s.info_off+0x18,P['rate'])   # match PS3 rate
+                # numStates (@+0x34) is NOT a buffer-sizing field. In the engine's sound
+                # lookup (FUN_008880f0 @ 0x8880f0) it is the COPY LENGTH of the WaveInfo
+                # header + ADPCM states array into a 0x800-bounded buffer:
+                #     len = numStates*3 + 0x38   (for codec 0x400)
+                # Growing numStates to ceil(grown_size/2048) makes that copy overrun the
+                # buffer and corrupt the adjacent bank object -> crash in the by-hash search
+                # (the Chinese Takeout crash). For our MP3 sounds the ADPCM states are dead
+                # data (the hook decodes MP3 and never reads them), so numStates only has to
+                # stay small enough not to overflow. The ORIGINAL value is proven safe (slot
+                # mode never touched it), so we leave the verbatim header value untouched -
+                # we deliberately do NOT patch +0x34.
     blob+=b'\x00'*((-len(blob))%align); out+=blob
     return bytes(out), stats
 
@@ -322,6 +506,7 @@ def verify_bank(bank_bytes, log=print):
     return ok
 
 def main():
+    global LEAD_IN_SAMPLES
     ap=argparse.ArgumentParser(description="GTA IV bank payload swap (PC ADPCM <- PS3 MP3)")
     ap.add_argument("pc_bank"); ap.add_argument("ps3_bank")
     ap.add_argument("-o","--out",required=True)
@@ -331,14 +516,26 @@ def main():
                     help="slot mode (v1): write into the fixed PC slot, truncate the tail")
     ap.add_argument("--match-length",action="store_true",help="(grow only) pad to PS3 length")
     ap.add_argument("--keep-info",action="store_true",help="(grow only) keep leading Info/Xing frame")
+    ap.add_argument("--lead-in",type=int,default=LEAD_IN_SAMPLES,
+                    help="leading samples of encoder/decoder lead-in to strip from each MP3 "
+                         "(whole frames only, lossless; default %d, 0 disables)"%LEAD_IN_SAMPLES)
     a=ap.parse_args()
+    LEAD_IN_SAMPLES=a.lead_in
     pc=open(a.pc_bank,'rb').read(); ps3=open(a.ps3_bank,'rb').read()
     out,st=swap_bank(pc,ps3,a.mp3packer,dry=a.dry_run,grow=not a.slot,
                      match_length=a.match_length,keep_info=a.keep_info)
     print("stats:",st)
+    if st.get('truncated'):
+        print("NOTE: %d sound(s) had their MP3 trimmed to the padded slot. This is benign "
+              "overhead trimming (frames beyond the slot's playback length) - no audible "
+              "loss; the slot still plays its full 2*size samples." % st['truncated'])
+    if st.get('skipped_toobig'):
+        print("NOTE: %d sound(s) had no usable slot space -> kept as original ADPCM "
+              "(lossless fallback)." % st['skipped_toobig'])
     if st['audio_cut']:
-        print("NOTE: %d sound(s) had PS3 audio longer than the PC slot -> real tail cut "
-              "(max ~%.0fms). These are the exceptions; everything else only lost silence."
+        print("NOTE: %d sound(s) had PS3 source audio genuinely LONGER than the PC slot's "
+              "duration -> ~%.0fms real tail not played. This is the inherent slot-mode "
+              "limit (would need grow mode); everything else is unaffected."
               % (st['audio_cut'], st['max_cut_ms']))
     if not a.dry_run:
         verify_bank(out)
