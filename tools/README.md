@@ -24,6 +24,11 @@ You still supply yourself:
   fixed PC slot, truncate the tail; warns if a PS3 line is longer than its slot).
 - `analyze_packed.py` — confirm an MP3 is clean uniform CBR (no gaps)
 - `mp3_framemap.py` — CBR/VBR frame analyzer
+- `slotcheck.py` — QA a converted RPF: flags any swapped bank sound that would play as
+  noise — checks the first frame fits the slot, the sync chain is intact, and the rate is
+  consistent. Pass the original RPF as a 3rd arg to byte-diff each slot, which separates a
+  genuinely broken swap from an untouched ADPCM sound:
+  `py slotcheck.py <GTAIV.exe> <converted.rpf> [original.rpf]`
 
 CBR rate is derived per sound from the sample rate (`kbps = rate × 4 / 1000`):
 32 kHz → 128, 24 kHz → 96. PCM banks (`codec 0x1`) are intentionally left alone.
