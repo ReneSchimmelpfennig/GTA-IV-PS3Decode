@@ -115,6 +115,7 @@
 #include <vector>
 #include <map>
 #include <cstdio>
+#include <cstring>
 #include <cstdarg>
 #include <cmath>
 #define MINIMP3_IMPLEMENTATION
@@ -516,20 +517,65 @@ void __fastcall hkInit(void* voice, void* edx, void* p2) {
     oInit(voice, edx, p2);
 }
 
+// --- Startup ordering (FusionFix 5.1.3+ compatibility, fix #18) ---------------
+// FusionFix's menumusic module pattern-scans the first bytes of the ADPCM decoder
+// ("51 8B 54 24 14 53 8B 5C 24 14") and of neighbouring audVoicePcAdpcm functions
+// during its synchronous Init (called from InitializeASI at the game's entry point).
+// If our MinHook JMP is already sitting on those bytes, the scan finds nothing and
+// FusionFix dereferences an empty pattern -> null-pointer crash on startup.
+// The old fixed Sleep(2000) used to land after FusionFix's init; with the newer
+// Ultimate ASI Loader it lands before it. So instead of a fixed delay we wait for
+// the game's own window: it is created in WinMain, which only runs after every
+// plugin's InitializeASI has returned. Hooking then is still well before the audio
+// engine decodes its first ADPCM block, and FusionFix keeps a pointer to the
+// (later hooked) decoder entry, so its own decode calls also pass through us.
+static BOOL CALLBACK FindGameWindow(HWND hwnd, LPARAM found) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    char cls[64] = {};
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    if (strcmp(cls, "grcWindow") == 0 || IsWindowVisible(hwnd)) {
+        *(bool*)found = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void WaitForGameWindow() {
+    for (int waited = 0; waited < 60000; waited += 50) {
+        bool found = false;
+        EnumWindows(FindGameWindow, (LPARAM)&found);
+        if (found) return;
+        Sleep(50);
+    }
+}
+
+static void LogFailure(const char* what) {
+    // Only written on failure, so a working install never creates this file.
+    FILE* f = nullptr;
+    if (fopen_s(&f, "GTA4MP3_error.log", "a") == 0 && f) {
+        fprintf(f, "GTA4MP3: %s - MP3 decoding is NOT active.\n", what);
+        fclose(f);
+    }
+}
+
 static DWORD WINAPI Inst(LPVOID) {
-    Sleep(2000);
+    WaitForGameWindow();
     InitializeCriticalSection(&g_cs);
     InitializeCriticalSection(&g_log_cs); g_log_ready = true;
     uintptr_t b = (uintptr_t)GetModuleHandleA(nullptr);
     g_base = b;
-    if (MH_Initialize() != MH_OK) return 1;
+    if (MH_Initialize() != MH_OK) { LogFailure("MH_Initialize failed"); return 1; }
     void* t = (void*)(b + RVA_Decode);
-    if (MH_CreateHook(t, &hkDecode, (void**)&oDecode) != MH_OK) return 1;
-    if (MH_EnableHook(t) != MH_OK) return 1;
+    if (MH_CreateHook(t, &hkDecode, (void**)&oDecode) != MH_OK) { LogFailure("decoder hook failed"); return 1; }
+    if (MH_EnableHook(t) != MH_OK) { LogFailure("decoder hook enable failed"); return 1; }
     void* rc = (void*)(b + RVA_RadioCouple);
     if (MH_CreateHook(rc, &hkCouple, (void**)&oCoupleF) == MH_OK) MH_EnableHook(rc);
+    else LogFailure("radio couple hook failed (decoder hook still active)");
     void* ti = (void*)(b + RVA_Init);
     if (MH_CreateHook(ti, &hkInit, (void**)&oInit) == MH_OK) MH_EnableHook(ti);
+    else LogFailure("init hook failed (decoder hook still active)");
     return 0;
 }
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
