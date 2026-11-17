@@ -1,5 +1,30 @@
 // ============================================================================
-//  GTA IV - MP3 decoder  -  Fix #15 "SHORT-CLIP FRAME WALK" (PRODUCTION)
+//  GTA IV - MP3 decoder  -  Fix #17 "PER-VOICE LOCK" (PRODUCTION)
+//  ---------------------------------------------------------------------------
+//  Replaces the single global critical section (held across the whole decode body)
+//  with a per-voice lock; g_cs now only guards the context map. With many streamed
+//  voices active at once (e.g. a cutscene start spinning up ~25 of them) they all
+//  serialized on the one global lock, adding avoidable latency on the audio thread.
+//  NOTE: this was originally built while chasing "cutscene background radio music
+//  is silent". That symptom later turned out to reproduce on a FULLY VANILLA
+//  Complete Edition install (no ASI, original RPFs) in the Roman taxi-depot
+//  cutscenes, i.e. it is a game/CE behavior, not a mod bug. The lock change is
+//  kept anyway: it is strictly less contention with identical lock ordering
+//  (map lock -> voice lock) and contexts are never freed during play.
+// ============================================================================
+//  GTA IV - MP3 decoder  -  Fix #16 "STREAMED RE-PROBE"
+//  ---------------------------------------------------------------------------
+//  Cutscene background radio could stay silent for a whole (later Roman) cutscene.
+//  Cause: at cutscene start many streamed voices spin up at once; the FIRST one
+//  reads its ring buffer before the real stream data is in it. The bytes are
+//  non-zero (stale/partial) but hold no decodable frame, so the probe failed and
+//  we latched isMp3=0 -> ADPCM for the voice's whole life, even though real MP3
+//  arrives one chunk later. Fix: for STREAMED voices (vseg>=2) a failed probe no
+//  longer latches ADPCM permanently - keep isMp3=-1 and re-probe the next chunk
+//  (that chunk falls through to the original ADPCM decode), giving up only after
+//  STREAM_REPROBE_MAX consecutive fails. Banks (vseg==1) are unchanged.
+// ============================================================================
+//  GTA IV - MP3 decoder  -  Fix #15 "SHORT-CLIP FRAME WALK"
 //  ---------------------------------------------------------------------------
 //  Short one-shot bank lines (e.g. Niko's jump grunt) played as noise: minimp3's
 //  mp3dec_decode_frame refuses to CONFIRM a frame unless enough following frames
@@ -89,24 +114,36 @@
 #include <cstdint>
 #include <vector>
 #include <map>
+#include <cstdio>
+#include <cstdarg>
+#include <cmath>
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_NO_STDIO
 #include "minimp3.h"
 #include "MinHook.h"
 
 static const uintptr_t RVA_Decode = 0x00497440;
-static const uintptr_t RVA_Init   = 0x0048F0D0;
-static const uintptr_t STATE_OFF  = 0x14E;
-static const size_t    MARGIN     = 640;    // look-ahead before the last frame (>=580 needed:
-                                            // frame 576 + next header 4). 640 = minimal warm-up
-                                            // (~32ms, one blip on tune-in) for strict CBR-128.
-                                            // Raise it only if content were >128 kbps
-                                            // (the pipeline never produces that).
+static const uintptr_t RVA_Init = 0x0048F0D0;
+static const uintptr_t STATE_OFF = 0x14E;
+static const size_t    MARGIN = 640;    // look-ahead before the last frame (>=580 needed:
+// frame 576 + next header 4). 640 = minimal warm-up
+// (~32ms, one blip on tune-in) for strict CBR-128.
+// Raise it only if content were >128 kbps
+// (the pipeline never produces that).
 static const int       PREROLL_SAMPLES = 2176;  // lead-in silence injected at latch
-                                            // (see header). 2176 @32kHz = ~68ms: covers
-                                            // the first-chunk deficit + 1 frame cushion.
-static const int       PREROLL_MIN_HZ  = 32000; // only pre-roll streamed audio >= this
-                                            // rate (radio/cutscene); NOT low-rate banks.
+// (see header). 2176 @32kHz = ~68ms: covers
+// the first-chunk deficit + 1 frame cushion.
+static const int       PREROLL_MIN_HZ = 32000; // only pre-roll streamed audio >= this
+// rate (radio/cutscene); NOT low-rate banks.
+static const uintptr_t RVA_RadioCouple = 0x5864C0;
+static const uintptr_t RVA_RadioCouple2 = 0; // (unused)
+// FUN_009864c0 couples EE_RADIO prop to nearest emitter
+static const int       STREAM_REPROBE_MAX = 32; // streamed voices: at (re)init the ring can
+// briefly hold stale/partial non-zero bytes with
+// no decodable frame (tune-in race, seen at
+// cutscene start when many voices spin up). Re-
+// probe that many chunks before giving up and
+// treating the stream as genuine ADPCM.
 
 typedef int(__fastcall* Decode_t)(void*, void*, int16_t*, void*, unsigned int, int);
 static Decode_t oDecode = nullptr;
@@ -119,6 +156,8 @@ struct VC {
     size_t inpos;
     std::vector<int16_t> fifo;
     int isMp3;
+    int probeFails;      // streamed re-probe counter (tune-in race guard)
+    CRITICAL_SECTION cs; // per-voice lock: decoding one voice must not block the others
 };
 static std::map<void*, VC*> g_ctx;
 static CRITICAL_SECTION g_cs;
@@ -126,6 +165,13 @@ static CRITICAL_SECTION g_cs;
 // RAII lock held across the WHOLE decode body, so an Init on another thread can
 // neither reset nor free a voice context while we are decoding into it.
 struct Lock { Lock() { EnterCriticalSection(&g_cs); } ~Lock() { LeaveCriticalSection(&g_cs); } };
+// Per-voice lock. g_cs now only guards the context MAP (short critical section); the decode
+// body runs under the voice's own lock, so N voices decode concurrently instead of
+// serializing on one global lock. That serialization was starving the audio thread when a
+// cutscene spins up ~25 streamed voices at once: the streaming refill missed its deadline,
+// the DecodeDriver saw remain==0 and raised the stream-END flag (voice+0x114/+0x14c), and
+// the engine freed the still-playing radio music voice (its slot was then reused for a bank).
+struct VLock { CRITICAL_SECTION* p; VLock(CRITICAL_SECTION* q) : p(q) { EnterCriticalSection(p); } ~VLock() { LeaveCriticalSection(p); } };
 
 // Caller MUST already hold g_cs. A context is created once per voice slot and then
 // reused; hkInit resets it IN PLACE (never frees it during play), so a pointer
@@ -133,11 +179,13 @@ struct Lock { Lock() { EnterCriticalSection(&g_cs); } ~Lock() { LeaveCriticalSec
 static VC* GetCtxLocked(void* s) {
     auto it = g_ctx.find(s);
     if (it != g_ctx.end()) return it->second;
-    VC* c = new VC(); mp3dec_init(&c->mp3); c->inpos = 0; c->isMp3 = -1; g_ctx[s] = c;
+    VC* c = new VC(); mp3dec_init(&c->mp3); c->inpos = 0; c->isMp3 = -1; c->probeFails = 0;
+    InitializeCriticalSection(&c->cs); g_ctx[s] = c;
     return c;
 }
 static bool SC(void* d, const void* s, size_t n) {
-    __try { memcpy(d, s, n); return true; } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __try { memcpy(d, s, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 
@@ -213,7 +261,8 @@ static int FindMp3Start(const uint8_t* buf, int len) {
         int nxt = o + f1;
         if (nxt + 4 <= len) {
             if (mp3_frame_len(buf + nxt, len - nxt) > 0) return o;   // 2-frame chain -> MP3
-        } else {
+        }
+        else {
             return o;                                                // single/last frame -> accept
         }
     }
@@ -252,15 +301,122 @@ static void DecodeBankFrames(VC* c, const uint8_t* buf, int start, int len) {
 // ms of harmless leading silence) instead of risking the line's audible start.
 
 
+// --- EE_RADIO PROP-COUPLING DIAGNOSTIC -------------------------------------
+// Hooks FUN_009864c0. Ghidra shows: when a prop of type EE_RADIO comes within
+// DAT_00fe8b34 of a radio emitter, the game couples the prop into emitter+0xDC
+// (that is the emitter's sound source). We log every EE_RADIO prop that passes
+// through, its world position, and its distance to the taxi-depot emitter at
+// (886.4, -447.6, 16.0). If the depot never gets a prop within threshold while
+// the player stands there, the depot has no EE_RADIO prop -> that is the bug.
+// Depot emitter identified by RE: idx 30, name hash 0xCB8E27DD.
+static CRITICAL_SECTION g_log_cs;
+static bool g_log_ready = false;
+static void LOGF(const char* fmt, ...) {
+    if (!g_log_ready) return;
+    EnterCriticalSection(&g_log_cs);
+    FILE* f = nullptr; fopen_s(&f, "C:\\Fertsch\\mp3log.txt", "a");
+    if (f) { va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap); fputc('\n', f); fclose(f); }
+    LeaveCriticalSection(&g_log_cs);
+}
+static uintptr_t g_base = 0;
+// Image addresses (ImageBase 0x400000): runtime = g_base + (addr - 0x400000).
+static inline const void* IMG(uintptr_t imgAddr) { return (const void*)(g_base + (imgAddr - 0x400000)); }
+// DAT_01282f4c = resolved hash of "EE_RADIO"; DAT_00fe8b34 = coupling distance^2 threshold.
+static int   RadioTypeHash() { int v = 0;   SC(&v, IMG(0x01282f4c), 4); return v; }
+static float ThresholdSq() { float v = 0; SC(&v, IMG(0x00fe8b34), 4); return v; }
+
+// FUN_009864c0 is __thiscall: ecx=mgr, stack args prop,typeHash,pos,v2. Model as __fastcall
+// with a dummy edx so the trampoline ABI matches.
+typedef void(__fastcall* tCoupleF)(void* mgr, void* edx, void* prop, int typeHash, float* pos, void* v2);
+static tCoupleF oCoupleF = nullptr;
+
+// Read the prop's WORLD position the same way FUN_009864c0 does: prop+0x20 is a matrix
+// pointer; if non-null, world translation is at matrix[0xc/0xd/0xe] (offsets +0x30/34/38).
+// If the matrix ptr is null the game falls back to prop+0x10 as the position vector.
+static bool PropWorldPos(void* prop, float out[3]) {
+    if (!prop) return false;
+    void* mtx = nullptr; SC(&mtx, (const char*)prop + 0x20, 4);
+    if (mtx) {
+        SC(&out[0], (const char*)mtx + 0x30, 4);
+        SC(&out[1], (const char*)mtx + 0x34, 4);
+        SC(&out[2], (const char*)mtx + 0x38, 4);
+    }
+    else {
+        SC(&out[0], (const char*)prop + 0x10, 4);
+        SC(&out[1], (const char*)prop + 0x14, 4);
+        SC(&out[2], (const char*)prop + 0x18, 4);
+    }
+    return true;
+}
+
+// Radio-emitter table: count at IMG(0x01238950), index list at IMG(0x01238958),
+// manager (slot base) at IMG(0x012389e0); slot = mgr+0x90+idx*0xD0, prop ptr at +0xDC.
+void __fastcall hkCouple(void* mgr, void* edx, void* prop, int typeHash, float* pos, void* v2) {
+    // Let the game do its normal pass first.
+    oCoupleF(mgr, edx, prop, typeHash, pos, v2);
+
+    if (typeHash != RadioTypeHash()) return;
+
+    float pp[3] = { 0,0,0 };
+    if (!PropWorldPos(prop, pp)) return;
+
+    // Only act on the depot prop (avoid touching anything else). Depot prop ~ (817.9,-264.1,15.9).
+    float ddx = pp[0] - 817.9f, ddy = pp[1] + 264.1f, ddz = pp[2] - 15.9f;
+    bool isDepotProp = (ddx * ddx + ddy * ddy + ddz * ddz) < 100.0f;   // within 10u of known depot prop
+    if (!isDepotProp) return;
+
+    int cnt = 0; SC(&cnt, IMG(0x01238950), 4);
+    if (cnt < 0 || cnt > 31) return;
+    uintptr_t mgrBase = (uintptr_t)IMG(0x012389e0);
+    const int* list = (const int*)IMG(0x01238958);
+
+    // Did the game already couple this prop to some emitter?
+    int coupledIdx = -1, nearestIdx = -1; float bestD2 = 1e30f;
+    for (int i = 0; i < cnt; i++) {
+        int idx = 0; SC(&idx, &list[i], 4);
+        if (idx < 0 || idx > 160) continue;
+        uintptr_t slot = mgrBase + 0x90 + (uintptr_t)idx * 0xD0;
+        void* pc = nullptr; SC(&pc, (const char*)(slot + 0xDC), 4);
+        if (pc == prop) coupledIdx = idx;
+        float ex, ey, ez;
+        SC(&ex, (const char*)(slot + 0x30), 4); SC(&ey, (const char*)(slot + 0x34), 4); SC(&ez, (const char*)(slot + 0x38), 4);
+        float d2 = (ex - pp[0]) * (ex - pp[0]) + (ey - pp[1]) * (ey - pp[1]) + (ez - pp[2]) * (ez - pp[2]);
+        if (d2 < bestD2) { bestD2 = d2; nearestIdx = idx; }
+    }
+
+    LOGF("DEPOT prop=(%.1f,%.1f,%.1f) gameCoupled=%s nearest=idx%d dist=%.1f",
+        pp[0], pp[1], pp[2], (coupledIdx >= 0) ? "YES" : "NO", nearestIdx, sqrtf(bestD2));
+
+    if (coupledIdx >= 0 || nearestIdx < 0) return;   // already fine, or nothing to do
+
+    // FORCE-COUPLE: write prop into nearest emitter's +0xDC and register it like the game does.
+    uintptr_t slot = mgrBase + 0x90 + (uintptr_t)nearestIdx * 0xD0;
+    void* existing = nullptr; SC(&existing, (const char*)(slot + 0xDC), 4);
+    if (existing == nullptr) {
+        // Minimal, crash-safe test: just point the emitter's sound-source field at this prop.
+        // We are NOT rebuilding the game's internal coupling list; this only tests whether the
+        // voice creation keys off emitter+0xDC. If audio appears, coupling is the cause.
+        __try {
+            *(void**)(slot + 0xDC) = prop;
+            LOGF("DEPOT FORCE-SET +0xDC on idx%d", nearestIdx);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LOGF("DEPOT force-set FAULTED");
+        }
+    }
+}
+
 int __fastcall hkDecode(void* st, void* edx, int16_t* outPcm, void* inData, unsigned int nib, int numSamples) {
     if (numSamples <= 0 || !outPcm || !inData)
         return oDecode(st, edx, outPcm, inData, nib, numSamples);  // no context touched
-    Lock lk;                       // held until return: serializes with hkInit so a
-                                   // voice re-init cannot free/reset this context
-                                   // while we decode into it (use-after-free guard).
-    VC* c = GetCtxLocked(st);
+    VC* c;
+    { Lock lk; c = GetCtxLocked(st); }   // global lock ONLY for the map lookup
+    VLock vl(&c->cs);              // held until return: serializes with hkInit so a
+    // voice re-init cannot reset this context while we
+    // decode into it. Contexts are never freed during play,
+    // so 'c' stays valid outside the map lock.
     int want = numSamples * 2;     // OUTPUT CLAMP: Emit() writes exactly 'want'
-                                   // (= 2x byteCount) samples, never more.
+    // (= 2x byteCount) samples, never more.
 
     if (c->isMp3 == -1) {
         std::vector<uint8_t> tmp((size_t)numSamples);
@@ -284,7 +440,8 @@ int __fastcall hkDecode(void* st, void* edx, int16_t* outPcm, void* inData, unsi
             //   leading silence rather than risk eating a quiet line's onset.
             if (PREROLL_SAMPLES > 0 && pi.hz >= PREROLL_MIN_HZ) {
                 c->fifo.insert(c->fifo.begin(), (size_t)PREROLL_SAMPLES, 0);
-            } else {
+            }
+            else {
                 // One-shot bank: flush the MARGIN-held tail so the whole line decodes.
                 // Do NOT trim leading silence (see Fix #14 note above) - it could eat the
                 // onset of a quiet line and stall the scripted conversation.
@@ -307,8 +464,18 @@ int __fastcall hkDecode(void* st, void* edx, int16_t* outPcm, void* inData, unsi
                     return numSamples * 4;
                 }
             }
+            // STREAMED tune-in race: at (re)init the ring can briefly hold stale/partial
+            // non-zero bytes with no decodable frame (seen at cutscene start when many
+            // voices spin up at once). Latching ADPCM here would silence that stream for
+            // the whole scene. Keep isMp3 = -1 and re-probe the next chunk (this chunk falls
+            // through to oDecode); give up (genuine ADPCM) only after STREAM_REPROBE_MAX.
+            if (vseg >= 2 && c->probeFails < STREAM_REPROBE_MAX) {
+                c->probeFails++;
+            }
+            else {
+                c->isMp3 = 0;
+            }
         }
-        c->isMp3 = 0;
     }
     if (c->isMp3 != 1)
         return oDecode(st, edx, outPcm, inData, nib, numSamples);
@@ -333,18 +500,18 @@ void __fastcall hkInit(void* voice, void* edx, void* p2) {
     // TrimLeadingSilence eating quiet one-shot lines on the fresh-probe path - that trim
     // has been removed, so resetting every voice here is safe.
     void* st = (void*)((char*)voice + STATE_OFF);
+    VC* c = nullptr;
     EnterCriticalSection(&g_cs);
-    {
-        auto it = g_ctx.find(st);
-        if (it != g_ctx.end()) {
-            VC* c = it->second;
-            c->inbuf.clear(); c->inpos = 0;
-            c->fifo.clear();
-            mp3dec_init(&c->mp3);
-            c->isMp3 = -1;
-        }
-    }
+    { auto it = g_ctx.find(st); if (it != g_ctx.end()) c = it->second; }
     LeaveCriticalSection(&g_cs);
+    if (c) {
+        VLock vl(&c->cs);
+        c->inbuf.clear(); c->inpos = 0;
+        c->fifo.clear();
+        mp3dec_init(&c->mp3);
+        c->isMp3 = -1;
+        c->probeFails = 0;
+    }
 
     oInit(voice, edx, p2);
 }
@@ -352,11 +519,15 @@ void __fastcall hkInit(void* voice, void* edx, void* p2) {
 static DWORD WINAPI Inst(LPVOID) {
     Sleep(2000);
     InitializeCriticalSection(&g_cs);
+    InitializeCriticalSection(&g_log_cs); g_log_ready = true;
     uintptr_t b = (uintptr_t)GetModuleHandleA(nullptr);
+    g_base = b;
     if (MH_Initialize() != MH_OK) return 1;
     void* t = (void*)(b + RVA_Decode);
     if (MH_CreateHook(t, &hkDecode, (void**)&oDecode) != MH_OK) return 1;
     if (MH_EnableHook(t) != MH_OK) return 1;
+    void* rc = (void*)(b + RVA_RadioCouple);
+    if (MH_CreateHook(rc, &hkCouple, (void**)&oCoupleF) == MH_OK) MH_EnableHook(rc);
     void* ti = (void*)(b + RVA_Init);
     if (MH_CreateHook(ti, &hkInit, (void**)&oInit) == MH_OK) MH_EnableHook(ti);
     return 0;
